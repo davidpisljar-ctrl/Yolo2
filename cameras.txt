@@ -1,0 +1,6 @@
+Kamera 1 Zgoraj| rtsp://admin:manowar82@192.168.30.4:554/cam/realmonitor?channel=1&subtype=0
+Kamera 2 Smetnjaki | http://192.168.30.148:8888/cam1clean/index.m3u8
+Kamera 3 Vas 1 | http://192.168.30.148:8888/cam2clean/index.m3u8
+Kamera 4 Vas 2 | http://192.168.30.148:8888/cam3clean/index.m3u8
+Kamera 5 Log 1 | http://192.168.30.148:8888/cam4clean/index.m3u8
+Kamera 6 Log 2 | http://192.168.30.148:8888/cam5clean/index.m3u8
