@@ -60,6 +60,7 @@ if not os.path.exists(CONFIG_FILE):
 confidence_threshold = 0.60
 log_file = logs/detections.csv
 log_cooldown_seconds = 2
+use_yolo_world = auto
 
 [filters]
 classes = person,car
@@ -75,6 +76,7 @@ CONFIDENCE_THRESHOLD = float(config["general"]["confidence_threshold"])
 LOG_FILE = config["general"]["log_file"]
 COOLDOWN_SECONDS = float(config["general"]["log_cooldown_seconds"])
 YOLO_LOGGING = config["general"].get("yolo_logging", "True").strip().lower() in ("true", "1", "yes")
+USE_YOLO_WORLD_RAW = config["general"].get("use_yolo_world", "auto").strip().lower()
 
 
 FILTER_CLASSES_RAW = config["filters"]["classes"].strip()
@@ -447,6 +449,7 @@ class YoloGUI:
         self.model = None
         self.device = self.select_device()
         self.yolo_model_name = config["general"].get("YOLO_MODEL", "yolov8m.pt").strip()
+        self.use_yolo_world_pref = USE_YOLO_WORLD_RAW
         self.use_yolo_world = False
 
         self.frames = {}
@@ -493,7 +496,14 @@ class YoloGUI:
         # Uporabi že prebrano ime modela iz __init__()
         model_path = os.path.join("models", self.yolo_model_name)
         model_name_lower = self.yolo_model_name.lower()
-        self.use_yolo_world = "world" in model_name_lower
+
+        def str_to_bool(v):
+            return str(v).strip().lower() in ("true", "1", "yes", "on")
+
+        if self.use_yolo_world_pref and self.use_yolo_world_pref not in ("auto", ""):
+            self.use_yolo_world = str_to_bool(self.use_yolo_world_pref)
+        else:
+            self.use_yolo_world = "world" in model_name_lower
 
         # Naloži model ali uporabi fallback
         if not os.path.exists(model_path):
@@ -521,10 +531,6 @@ class YoloGUI:
                 print(f"⚠ Nastavljanje YOLO-World razredov ni uspelo: {e}")
 
         # Preberi prikazne nastavitve iz settings.ini
-        # Pretvorimo string -> bool
-        def str_to_bool(v):
-            return str(v).strip().lower() in ("true", "1", "yes", "on")
-
         self.render_boxes = str_to_bool(config["general"].get("SHOW_BOXES", "True"))
         self.render_labels = str_to_bool(config["general"].get("SHOW_LABELS", "True"))
         self.render_conf = str_to_bool(config["general"].get("SHOW_CONFIDENCE", "True"))
