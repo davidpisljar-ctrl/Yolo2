@@ -2,7 +2,7 @@ import cv2
 import time
 import torch
 import threading
-from ultralytics import YOLO
+from ultralytics import YOLO, YOLOWorld
 import numpy as np
 import os
 import csv
@@ -237,7 +237,10 @@ class CameraThread(threading.Thread):
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 conf = float(box.conf[0])
                 cls_id = int(box.cls[0])
-                label = names[cls_id]
+                if isinstance(names, dict):
+                    label = names.get(cls_id, str(cls_id))
+                else:
+                    label = names[cls_id]
 
                 if FILTER_CLASSES and label not in FILTER_CLASSES:
                     continue
@@ -381,7 +384,10 @@ class CameraThread(threading.Thread):
             for box in boxes:
                 conf = float(box.conf[0])
                 cls_id = int(box.cls[0])
-                label = names[cls_id]
+                if isinstance(names, dict):
+                    label = names.get(cls_id, str(cls_id))
+                else:
+                    label = names[cls_id]
 
                 if self.should_log_detection(label, conf, now):
                     self.log_callback(self.name, label, conf)
@@ -441,6 +447,7 @@ class YoloGUI:
         self.model = None
         self.device = self.select_device()
         self.yolo_model_name = config["general"].get("YOLO_MODEL", "yolov8m.pt").strip()
+        self.use_yolo_world = False
 
         self.frames = {}
         self.led_labels = {}
@@ -485,6 +492,8 @@ class YoloGUI:
     def load_model(self):
         # Uporabi že prebrano ime modela iz __init__()
         model_path = os.path.join("models", self.yolo_model_name)
+        model_name_lower = self.yolo_model_name.lower()
+        self.use_yolo_world = "world" in model_name_lower
 
         # Naloži model ali uporabi fallback
         if not os.path.exists(model_path):
@@ -494,7 +503,22 @@ class YoloGUI:
         print(f"🔍 Nalagam YOLO model: {model_path}")
 
         # YOLO model → GPU ali CPU
-        self.model = YOLO(model_path).to(self.device)
+        if self.use_yolo_world:
+            try:
+                self.model = YOLOWorld(model_path).to(self.device)
+            except Exception as e:
+                print(f"⚠ Nalaganje YOLO-World modela ni uspelo ({e}). Uporabljam klasičen YOLO.")
+                self.use_yolo_world = False
+                self.model = YOLO(model_path).to(self.device)
+        else:
+            self.model = YOLO(model_path).to(self.device)
+
+        if self.use_yolo_world and FILTER_CLASSES:
+            try:
+                self.model.set_classes(FILTER_CLASSES)
+                print(f"🎯 YOLO-World uporablja razrede iz settings.ini: {', '.join(FILTER_CLASSES)}")
+            except Exception as e:
+                print(f"⚠ Nastavljanje YOLO-World razredov ni uspelo: {e}")
 
         # Preberi prikazne nastavitve iz settings.ini
         # Pretvorimo string -> bool
@@ -1084,7 +1108,7 @@ class YoloGUI:
                 f"VRAM: {gpu_mem:.1f}%  |  "
                 f"Temp: {gpu_temp}°C  |  "
                 f"↑ {up_str}  ↓ {down_str}  |  "
-                f"YOLO model: {self.yolo_model_name}  |  "
+                f"YOLO model: {self.yolo_model_name} ({'YOLO-World' if self.use_yolo_world else 'YOLO'})  |  "
                 f"Filtrirani razredi: {filtered}  |  "
                 f"{datetime.now().strftime('%H:%M:%S')}"
             )
