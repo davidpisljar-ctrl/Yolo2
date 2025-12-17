@@ -129,7 +129,7 @@ class CameraThread(threading.Thread):
 
         self.last_logged = {}        # za cooldown po razredih
         self.logged_track_ids = set()
-        self.last_frame_time = time.time()
+        self.last_frame_time = None
 
         # zgodovina za 5s povprečja
         self.fps_history = []
@@ -154,7 +154,6 @@ class CameraThread(threading.Thread):
 
     def run(self):
         frame_id = 0
-        start = time.time()
         while not self.stop_event.is_set():
             frame_id += 1
 
@@ -205,19 +204,25 @@ class CameraThread(threading.Thread):
                 self.cap = None
                 continue
                 
-            if STREAM_FPS > 0:
-                processing_time = time.time() - start
-                delay = (1.0 / STREAM_FPS) - processing_time
-                if delay > 0:
-                    time.sleep(delay)
+            target_period = 1.0 / STREAM_FPS if STREAM_FPS > 0 else 0.0
 
-            # Izračun pretoka
-            dt = now - self.last_frame_time
-            self.last_frame_time = now
-            if dt > 0:
-                current_bitrate = frame.nbytes / dt
+            # Izračun časa med okvirji in po potrebi počakaj za ciljni FPS
+            if self.last_frame_time is None:
+                if target_period > 0:
+                    time.sleep(target_period)
+                    now = time.time()
+                dt = target_period if target_period > 0 else 0.0
             else:
-                current_bitrate = 0.0
+                dt = now - self.last_frame_time
+                if target_period > 0 and dt < target_period:
+                    time.sleep(target_period - dt)
+                    now = time.time()
+                    dt = now - self.last_frame_time
+
+            self.last_frame_time = now
+
+            # Izračun pretoka na kamero (bytes/s)
+            current_bitrate = frame.nbytes / dt if dt > 0 else 0.0
 
             # YOLO detekcija + DeepSORT tracking – DELAJ NA BGR
             start = time.time()
@@ -357,8 +362,8 @@ class CameraThread(threading.Thread):
 
             end = time.time()
 
-
-            current_fps = 1.0 / (end - start) if (end - start) > 0 else 0.0
+            # FPS temelji na dejanskem intervalu med okvirji
+            current_fps = 1.0 / dt if dt > 0 else 0.0
 
             # Zgodovina za povprečje 5s
             self.fps_history.append((now, current_fps))
