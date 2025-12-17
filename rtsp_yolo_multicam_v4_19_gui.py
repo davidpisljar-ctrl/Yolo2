@@ -12,10 +12,24 @@ from PIL import Image, ImageTk
 from datetime import datetime
 import configparser
 import psutil
-import GPUtil
-from bytetrack import ByteTracker
-import mysql.connector
-from mysql.connector import Error
+
+# Nekatera okolja nimajo vseh odvisnosti – omogoči robusten fallback
+try:
+    import GPUtil
+except Exception:
+    GPUtil = None
+
+try:
+    from bytetrack import ByteTracker
+except Exception:
+    ByteTracker = None
+
+try:
+    import mysql.connector
+    from mysql.connector import Error
+except Exception:
+    mysql = None
+    Error = Exception
 
 
 
@@ -123,7 +137,7 @@ class CameraThread(threading.Thread):
         self.parent = parent
     
         # inicializacija ByteTrack s konfiguracijo iz GUI (settings.ini)
-        if parent.tracker_enabled:
+        if parent.tracker_enabled and ByteTracker:
             self.tracker = ByteTracker(
                 track_thresh=parent.tracker_track_thresh,
                 match_thresh=parent.tracker_match_thresh,
@@ -131,6 +145,8 @@ class CameraThread(threading.Thread):
                 frame_rate= parent.tracker_frame_rate
             )
         else:
+            if parent.tracker_enabled and not ByteTracker:
+                print("⚠ ByteTrack modul ni na voljo – sledenje onemogočeno.")
             self.tracker = None
 
 
@@ -501,6 +517,10 @@ class YoloGUI:
         self.tracker_boxes = str_to_bool(tr.get("draw_boxes", "True"))
         self.tracker_ids = str_to_bool(tr.get("draw_ids", "True"))
 
+        if self.tracker_enabled and ByteTracker is None:
+            print("⚠ ByteTrack ni nameščen ali se ni naložil – sledenje izklopljeno.")
+            self.tracker_enabled = False
+
         self.tracker_frame_rate = float(tr.get("frame_rate", "30"))
         self.tracker_track_thresh = float(tr.get("track_thresh", "0.35"))
         self.tracker_match_thresh = float(tr.get("match_thresh", "0.7"))
@@ -654,9 +674,15 @@ class YoloGUI:
 
 
 
-    # ---------------- MySQL logging ------------------ 
+    # ---------------- MySQL logging ------------------
     def init_mysql(self):
         """Inicializacija MySQL povezave na osnovi settings.ini [mysql]"""
+        if mysql is None:
+            print("MySQL: modul mysql.connector ni na voljo – MySQL logiranje je izklopljeno.")
+            self.mysql_enabled = False
+            self.mysql_conn = None
+            return
+
         if "mysql" not in config:
             print("MySQL: [mysql] sekcija ni definirana v settings.ini – MySQL logiranje izklopljeno.")
             self.mysql_enabled = False
@@ -1009,16 +1035,21 @@ class YoloGUI:
         ram_usage = ram.percent
 
         # ---------------- GPU ----------------
-        gpus = GPUtil.getGPUs()
-        if gpus:
-            gpu = gpus[0]
-            gpu_load = gpu.load * 100
-            gpu_mem = gpu.memoryUtil * 100
-            gpu_temp = gpu.temperature
-        else:
-            gpu_load = 0
-            gpu_mem = 0
-            gpu_temp = 0
+        gpu_load = 0
+        gpu_mem = 0
+        gpu_temp = 0
+
+        if GPUtil:
+            try:
+                gpus = GPUtil.getGPUs()
+            except Exception as e:
+                gpus = []
+                print(f"⚠ GPUtil ni na voljo ali ne deluje pravilno: {e}")
+            if gpus:
+                gpu = gpus[0]
+                gpu_load = gpu.load * 100
+                gpu_mem = gpu.memoryUtil * 100
+                gpu_temp = getattr(gpu, "temperature", 0)
 
         # ---------------- Internetni pretok ----------------
         net = psutil.net_io_counters()
