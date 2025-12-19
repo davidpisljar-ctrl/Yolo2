@@ -13,6 +13,7 @@ from datetime import datetime
 import configparser
 import psutil
 import traceback
+import sys
 
 # Nekatera okolja nimajo vseh odvisnosti – omogoči robusten fallback
 try:
@@ -74,6 +75,18 @@ def log_exception(context, exc):
         pass
 
 
+def log_unhandled(exc_type, exc_value, exc_tb):
+    tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    msg = f"❌ Neobvladana napaka: {exc_value}\n{tb_text}"
+    print(msg)
+    if ERROR_LOG_FILE:
+        try:
+            with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+        except Exception:
+            pass
+
+
 # global buffer za mrežni promet
 _last_net = None
 _last_time = None
@@ -127,6 +140,13 @@ if LOG_DIR and not os.path.exists(LOG_DIR):
 # Shranjuj error log poleg ostalih logov, če obstaja mapa
 if LOG_DIR:
     ERROR_LOG_FILE = os.path.join(LOG_DIR, os.path.basename(ERROR_LOG_FILE))
+
+# Global hooks za neobvladane izjeme (tudi v threadih)
+sys.excepthook = log_unhandled
+if hasattr(threading, "excepthook"):
+    def _thread_excepthook(args):
+        log_unhandled(args.exc_type, args.exc_value, args.exc_traceback)
+    threading.excepthook = _thread_excepthook
 
 torch.backends.cudnn.benchmark = True
 
@@ -698,64 +718,66 @@ class YoloGUI:
     # ---------------- Deeptracker Logging ------------------
     def log_tracker_detection(self, camera_name, track_id, label, conf, filename):
         """Logiranje v CSV + (opcijsko) v MySQL tabelo YOLO_DT z retry sistemom."""
+        try:
+            # 1) CSV log
+            if self.tracker_logging:
+                try:
+                    with open(self.tracker_log_file, "a", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            camera_name,
+                            track_id,
+                            label,
+                            f"{conf:.2f}",
+                            filename or ""
+                        ])
+                except Exception as e:
+                    log_exception("tracker CSV write", e)
 
-        # 1) CSV log
-        if self.tracker_logging:
-            try:
-                with open(self.tracker_log_file, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        camera_name,
-                        track_id,
-                        label,
-                        f"{conf:.2f}",
-                        filename or ""
-                    ])
-            except Exception as e:
-                print("⚠ Napaka pri zapisovanju tracker CSV:", e)
-
-        # 2) MySQL log
-        if not self.mysql_enabled:
-            return
-
-        if self.mysql_conn is None:
-            return
-
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        sql = """
-            INSERT INTO YOLO_DT
-                (ts, camera_name, track_id, yolo_class, confidence, filename, plate_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """
-
-        data = (ts, camera_name, int(track_id), label, float(conf), filename or "", None)
-
-        # --- retry logika (max 3 poskusi) ---
-        attempts = 3
-
-        for attempt in range(1, attempts + 1):
-            try:
-                cursor = self.mysql_conn.cursor()
-                cursor.execute(sql, data)
-                cursor.close()
-
-                # OK, imamo success → prekini retry
+            # 2) MySQL log
+            if not self.mysql_enabled:
                 return
 
-            except Exception as e:
-                print(f"⚠ MySQL log napaka (poskus {attempt}/{attempts}): {e}")
+            if self.mysql_conn is None:
+                return
 
-                # Če smo izčrpali poskuse → končaj
-                if attempt == attempts:
-                    print("❌ MySQL log FAILED po 3 poskusih.\n")
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            sql = """
+                INSERT INTO YOLO_DT
+                    (ts, camera_name, track_id, yolo_class, confidence, filename, plate_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """
+
+            data = (ts, camera_name, int(track_id), label, float(conf), filename or "", None)
+
+            # --- retry logika (max 3 poskusi) ---
+            attempts = 3
+
+            for attempt in range(1, attempts + 1):
+                try:
+                    cursor = self.mysql_conn.cursor()
+                    cursor.execute(sql, data)
+                    cursor.close()
+
+                    # OK, imamo success → prekini retry
                     return
 
-                # Poskusi reconnect
-                print("↻ Poskus ponovne vzpostavitve MySQL povezave...")
-                self.reconnect_mysql()
-                time.sleep(0.5)  # malo počakaj
+                except Exception as e:
+                    log_exception(f"MySQL log poskus {attempt}/{attempts}", e)
+
+                    # Če smo izčrpali poskuse → končaj
+                    if attempt == attempts:
+                        print("❌ MySQL log FAILED po 3 poskusih.\n")
+                        return
+
+                    # Poskusi reconnect
+                    print("↻ Poskus ponovne vzpostavitve MySQL povezave...")
+                    self.reconnect_mysql()
+                    time.sleep(0.5)  # malo počakaj
+        except Exception as e:
+            log_exception("tracker logging", e)
 
 
 
@@ -803,10 +825,10 @@ class YoloGUI:
             else:
                 self.mysql_enabled = False
                 print("MySQL: Povezava ni uspela.")
-        except Error as e:
+        except Exception as e:
             self.mysql_enabled = False
             self.mysql_conn = None
-            print(f"MySQL: napaka pri povezavi: {e}")
+            log_exception("MySQL inicializacija", e)
             
             
     def reconnect_mysql(self):
@@ -840,7 +862,7 @@ class YoloGUI:
                 return True
 
         except Exception as e:
-            print(f"❌ MySQL reconnect error: {e}")
+            log_exception("MySQL reconnect", e)
 
         # fallback
         self.mysql_conn = None
