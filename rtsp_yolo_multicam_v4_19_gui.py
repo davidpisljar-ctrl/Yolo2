@@ -12,6 +12,7 @@ from PIL import Image, ImageTk
 from datetime import datetime
 import configparser
 import psutil
+import traceback
 
 # Nekatera okolja nimajo vseh odvisnosti – omogoči robusten fallback
 try:
@@ -37,6 +38,7 @@ except Exception:
 
 CONFIG_FILE = "settings.ini"
 CAMERA_FILE = "cameras.txt"
+ERROR_LOG_FILE = "errors.log"
 
 def format_bytes(value):
     """ Pretvori byte/s v spremenljive enote """
@@ -48,6 +50,28 @@ def format_bytes(value):
         return f"{value/(1024**2):.2f} MB/s"
     else:
         return f"{value/(1024**3):.2f} GB/s"
+
+
+def debug_print(message):
+    if DEBUG_MODE:
+        print(message)
+
+
+def log_exception(context, exc):
+    """Zapiše nepričakovane napake v konzolo in error log, da ne ostanejo tih izpadi."""
+    tb = traceback.format_exc()
+    msg = f"❌ Napaka ({context}): {exc}\n{tb}"
+    print(msg)
+
+    if not ERROR_LOG_FILE:
+        return
+
+    try:
+        with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        # ne povzročaj dodatnih napak zaradi logiranja
+        pass
 
 
 # global buffer za mrežni promet
@@ -77,6 +101,7 @@ LOG_FILE = config["general"]["log_file"]
 COOLDOWN_SECONDS = float(config["general"]["log_cooldown_seconds"])
 YOLO_LOGGING = config["general"].get("yolo_logging", "True").strip().lower() in ("true", "1", "yes")
 USE_YOLO_WORLD_RAW = config["general"].get("use_yolo_world", "auto").strip().lower()
+DEBUG_MODE = config["general"].get("debug", "False").strip().lower() in ("true", "1", "yes")
 
 
 FILTER_CLASSES_RAW = config["filters"]["classes"].strip()
@@ -91,6 +116,17 @@ if LOG_DIR and not os.path.exists(LOG_DIR):
         os.makedirs(LOG_DIR, exist_ok=True)
     except Exception as e:
         print("⚠ Napaka pri ustvarjanju log direktorija:", e)
+
+# Ustvari mapo za error log, če je potrebno
+if LOG_DIR and not os.path.exists(LOG_DIR):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except Exception as e:
+        print("⚠ Napaka pri ustvarjanju error log direktorija:", e)
+
+# Shranjuj error log poleg ostalih logov, če obstaja mapa
+if LOG_DIR:
+    ERROR_LOG_FILE = os.path.join(LOG_DIR, os.path.basename(ERROR_LOG_FILE))
 
 torch.backends.cudnn.benchmark = True
 
@@ -156,259 +192,274 @@ class CameraThread(threading.Thread):
         frame_id = 0
         while not self.stop_event.is_set():
             frame_id += 1
+            try:
 
-            # Auto-reconnect
-            # Kamera ni povezana
-            if self.cap is None or not self.cap.isOpened():
+                # Auto-reconnect
+                # Kamera ni povezana
+                if self.cap is None or not self.cap.isOpened():
 
-                # Posodobi GUI SAMO 1×, ne spamaj
-                if not self.reconnecting:
-                    self.reconnecting = True
+                    # Posodobi GUI SAMO 1×, ne spamaj
+                    if not self.reconnecting:
+                        self.reconnecting = True
 
-                    # Pošlji placeholder frame, ampak varno!
-                    try:
-                        self.update_callback(self.name, self.frame, self.fps,
-                                             self.detections, self.bitrate,
-                                             True, self.last_connect)
-                    except Exception:
-                        pass  # ne crashaj GUI
+                        # Pošlji placeholder frame, ampak varno!
+                        try:
+                            self.update_callback(self.name, self.frame, self.fps,
+                                                 self.detections, self.bitrate,
+                                                 True, self.last_connect)
+                        except Exception as e:
+                            log_exception(f"{self.name} update placeholder", e)
 
-                # počakaj 15 sekund pred ponovnim poskusom
-                self.reconnect_timer += 1
-                time.sleep(1)
+                    # počakaj 15 sekund pred ponovnim poskusom
+                    self.reconnect_timer += 1
+                    time.sleep(1)
 
-                if self.reconnect_timer < 15:
+                    if self.reconnect_timer < 15:
+                        continue
+
+                    self.reconnect_timer = 0
+
+                    # poskusi ponovno
+                    self.cap = cv2.VideoCapture(self.url)
+
+                    if self.cap.isOpened():
+                        self.reconnecting = False
+                        self.last_connect = datetime.now().strftime("%H:%M:%S")
+                        print(f"[{self.name}] Kamera ponovno povezana!")
+                    else:
+                        print(f"[{self.name}] Kamera še vedno offline...")
+
                     continue
 
-                self.reconnect_timer = 0
 
-                # poskusi ponovno
-                self.cap = cv2.VideoCapture(self.url)
+                # Branje frame-a
+                ret, frame = self.cap.read()
+                now = time.time()
 
-                if self.cap.isOpened():
-                    self.reconnecting = False
-                    self.last_connect = datetime.now().strftime("%H:%M:%S")
-                    print(f"[{self.name}] Kamera ponovno povezana!")
+                if not ret:
+                    self.cap.release()
+                    self.cap = None
+                    continue
+                    
+                target_period = 1.0 / STREAM_FPS if STREAM_FPS > 0 else 0.0
+
+                # Izračun časa med okvirji in po potrebi počakaj za ciljni FPS
+                if self.last_frame_time is None:
+                    if target_period > 0:
+                        time.sleep(target_period)
+                        now = time.time()
+                    dt = target_period if target_period > 0 else 0.0
                 else:
-                    print(f"[{self.name}] Kamera še vedno offline...")
-
-                continue
-
-
-            # Branje frame-a
-            ret, frame = self.cap.read()
-            now = time.time()
-
-            if not ret:
-                self.cap.release()
-                self.cap = None
-                continue
-                
-            target_period = 1.0 / STREAM_FPS if STREAM_FPS > 0 else 0.0
-
-            # Izračun časa med okvirji in po potrebi počakaj za ciljni FPS
-            if self.last_frame_time is None:
-                if target_period > 0:
-                    time.sleep(target_period)
-                    now = time.time()
-                dt = target_period if target_period > 0 else 0.0
-            else:
-                dt = now - self.last_frame_time
-                if target_period > 0 and dt < target_period:
-                    time.sleep(target_period - dt)
-                    now = time.time()
                     dt = now - self.last_frame_time
+                    if target_period > 0 and dt < target_period:
+                        time.sleep(target_period - dt)
+                        now = time.time()
+                        dt = now - self.last_frame_time
 
-            self.last_frame_time = now
+                self.last_frame_time = now
 
-            # Izračun pretoka na kamero (bytes/s)
-            current_bitrate = frame.nbytes / dt if dt > 0 else 0.0
+                # Izračun pretoka na kamero (bytes/s)
+                current_bitrate = frame.nbytes / dt if dt > 0 else 0.0
 
-            # YOLO detekcija + DeepSORT tracking – DELAJ NA BGR
-            start = time.time()
-            results = self.model(frame, verbose=False)  # ali self.model.predict(frame, verbose=False, device=self.device)
-            boxes = results[0].boxes
-            names = results[0].names
-            self.detections = len(boxes)
+                # YOLO detekcija + DeepSORT tracking – DELAJ NA BGR
+                start = time.time()
+                results = self.model(frame, verbose=False)  # ali self.model.predict(frame, verbose=False, device=self.device)
+                boxes = results[0].boxes
+                names = results[0].names
+                self.detections = len(boxes)
 
-            # osnovni YOLO anotirani frame (če je omogočeno)
-            annotated = results[0].plot(
-                boxes=self.render_boxes,
-                labels=self.render_labels,
-                conf=self.render_conf
-            )
-
-            # pripravimo detections za ByteTrack (filtrirani po dovoljenih razredih)
-            detections = []
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf = float(box.conf[0])
-                cls_id = int(box.cls[0])
-                if isinstance(names, dict):
-                    label = names.get(cls_id, str(cls_id))
-                else:
-                    label = names[cls_id]
-
-                if FILTER_CLASSES and label not in FILTER_CLASSES:
-                    continue
-
-                detections.append({
-                    "bbox": np.array([x1, y1, x2, y2], dtype=float),
-                    "score": conf,
-                    "label": label,
-                    "cls_id": cls_id,
-                })
-
-            # posodobitev trackerja
-            tracks = []
-            if self.tracker:
-                tracks = self.tracker.update(detections)
-                
-             # RISANJE TRACKER OKVIRJEV IN ID-jev  <----- TUKAJ!!!
-            for track in tracks:
-                if not track.is_confirmed():
-                    continue
-
-                track_id = track.track_id
-                ltrb = track.to_ltrb()
-                x1, y1, x2, y2 = map(int, ltrb)
-
-                if self.parent.show_tracker_boxes:
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                if self.parent.show_tracker_ids:
-                    cv2.putText(
-                        annotated,
-                        f"ID {track_id}",
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.2,
-                        (0, 255, 0),
-                        2
-                    )               
-                
-            # frame, na katerega rišemo tracker (YOLO anotirani)
-            draw_frame = annotated
-
-            for track in tracks:
-                if not track.is_confirmed():
-                    continue
-
-                track_id = track.track_id
-                ltrb = track.to_ltrb()
-                x1, y1, x2, y2 = map(int, ltrb)
-
-                # risanje DeepSORT okvirjev
-                if self.parent.show_tracker_boxes:
-                    cv2.rectangle(draw_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                # risanje DeepSORT ID-jev
-                if self.parent.show_tracker_ids:
-                    cv2.putText(
-                        draw_frame,
-                        f"ID {track_id}",
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 255, 0),
-                        2
-                    )
-            # TRACKER LOGGING — popolnoma ločeno od YOLO logiranja
-            # TRACKER LOGGING — vsak track_id se zapiše samo ENKRAT
-            for track in tracks:
-                if not track.is_confirmed():
-                    continue
-
-                track_id = track.track_id
-
-                # če smo ta track_id že zapisali, NE DELAJ NIČ
-                if track_id in self.logged_track_ids:
-                    continue
-
-                # vzemi YOLO podatke, ki jih DeepSORT pripne tracku
-                det_class = getattr(track, "label", None)
-                det_conf = getattr(track, "score", None)
-
-                if det_class is None or det_conf is None:
-                    continue
-
-                # preveri YOLO filter pogoje
-                if det_conf < CONFIDENCE_THRESHOLD:
-                    continue
-
-                if FILTER_CLASSES and det_class not in FILTER_CLASSES:
-                    continue
-
-                # PRINTSCREEN + filename
-                filename = None
-                try:
-                    filename = self.tracker_printscreen_callback(
-                        self.name, frame, det_class, track.to_ltrb()
-                    )
-                except Exception as e:
-                    print("⚠ Napaka pri printscreen callbacku:", e)
-
-                # ZAPIS V CSV (samo 1× za celoten lifetime tracka)
-                self.tracker_log_callback(
-                    self.name, track_id, det_class, det_conf, filename
+                # osnovni YOLO anotirani frame (če je omogočeno)
+                annotated = results[0].plot(
+                    boxes=self.render_boxes,
+                    labels=self.render_labels,
+                    conf=self.render_conf
                 )
 
-               
-                
-                # označi track_id kot že zapisan
-                self.logged_track_ids.add(track_id)
+                # pripravimo detections za ByteTrack (filtrirani po dovoljenih razredih)
+                detections = []
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    conf = float(box.conf[0])
+                    cls_id = int(box.cls[0])
+                    if isinstance(names, dict):
+                        label = names.get(cls_id, str(cls_id))
+                    else:
+                        label = names[cls_id]
+
+                    if FILTER_CLASSES and label not in FILTER_CLASSES:
+                        continue
+
+                    detections.append({
+                        "bbox": np.array([x1, y1, x2, y2], dtype=float),
+                        "score": conf,
+                        "label": label,
+                        "cls_id": cls_id,
+                    })
+
+                # posodobitev trackerja
+                tracks = []
+                if self.tracker:
+                    try:
+                        tracks = self.tracker.update(detections)
+                    except Exception as e:
+                        log_exception(f"{self.name} ByteTrack update", e)
+                        tracks = []
+                        
+                 # RISANJE TRACKER OKVIRJEV IN ID-jev  <----- TUKAJ!!!
+                for track in tracks:
+                    if not track.is_confirmed():
+                        continue
+
+                    track_id = track.track_id
+                    ltrb = track.to_ltrb()
+                    x1, y1, x2, y2 = map(int, ltrb)
+
+                    if self.parent.show_tracker_boxes:
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                    if self.parent.show_tracker_ids:
+                        cv2.putText(
+                            annotated,
+                            f"ID {track_id}",
+                            (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1.2,
+                            (0, 255, 0),
+                            2
+                        )               
+                    
+                # frame, na katerega rišemo tracker (YOLO anotirani)
+                draw_frame = annotated
+
+                for track in tracks:
+                    if not track.is_confirmed():
+                        continue
+
+                    track_id = track.track_id
+                    ltrb = track.to_ltrb()
+                    x1, y1, x2, y2 = map(int, ltrb)
+
+                    # risanje DeepSORT okvirjev
+                    if self.parent.show_tracker_boxes:
+                        cv2.rectangle(draw_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                    # risanje DeepSORT ID-jev
+                    if self.parent.show_tracker_ids:
+                        cv2.putText(
+                            draw_frame,
+                            f"ID {track_id}",
+                            (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 255, 0),
+                            2
+                        )
+                # TRACKER LOGGING — popolnoma ločeno od YOLO logiranja
+                # TRACKER LOGGING — vsak track_id se zapiše samo ENKRAT
+                for track in tracks:
+                    if not track.is_confirmed():
+                        continue
+
+                    track_id = track.track_id
+
+                    # če smo ta track_id že zapisali, NE DELAJ NIČ
+                    if track_id in self.logged_track_ids:
+                        continue
+
+                    # vzemi YOLO podatke, ki jih DeepSORT pripne tracku
+                    det_class = getattr(track, "label", None)
+                    det_conf = getattr(track, "score", None)
+
+                    if det_class is None or det_conf is None:
+                        continue
+
+                    # preveri YOLO filter pogoje
+                    if det_conf < CONFIDENCE_THRESHOLD:
+                        continue
+
+                    if FILTER_CLASSES and det_class not in FILTER_CLASSES:
+                        continue
+
+                    # PRINTSCREEN + filename
+                    filename = None
+                    try:
+                        filename = self.tracker_printscreen_callback(
+                            self.name, frame, det_class, track.to_ltrb()
+                        )
+                    except Exception as e:
+                        log_exception(f"{self.name} printscreen", e)
+
+                    # ZAPIS V CSV (samo 1× za celoten lifetime tracka)
+                    self.tracker_log_callback(
+                        self.name, track_id, det_class, det_conf, filename
+                    )
+
+                   
+                    
+                    # označi track_id kot že zapisan
+                    self.logged_track_ids.add(track_id)
 
 
 
-            end = time.time()
+                end = time.time()
 
-            # FPS temelji na dejanskem intervalu med okvirji
-            current_fps = 1.0 / dt if dt > 0 else 0.0
+                # FPS temelji na dejanskem intervalu med okvirji
+                current_fps = 1.0 / dt if dt > 0 else 0.0
 
-            # Zgodovina za povprečje 5s
-            self.fps_history.append((now, current_fps))
-            self.bitrate_history.append((now, current_bitrate))
+                # Zgodovina za povprečje 5s
+                self.fps_history.append((now, current_fps))
+                self.bitrate_history.append((now, current_bitrate))
 
-            self.fps_history = [(t, v) for (t, v) in self.fps_history
-                                if now - t <= self.history_window_seconds]
-            self.bitrate_history = [(t, v) for (t, v) in self.bitrate_history
+                self.fps_history = [(t, v) for (t, v) in self.fps_history
                                     if now - t <= self.history_window_seconds]
+                self.bitrate_history = [(t, v) for (t, v) in self.bitrate_history
+                                        if now - t <= self.history_window_seconds]
 
-            if self.fps_history:
-                self.fps = sum(v for (_, v) in self.fps_history) / len(self.fps_history)
-            else:
-                self.fps = 0.0
-
-            if self.bitrate_history:
-                self.bitrate = sum(v for (_, v) in self.bitrate_history) / len(self.bitrate_history)
-            else:
-                self.bitrate = 0.0
-
-            # LOGIRANJE – tu se upošteva:
-            # - CONFIDENCE_THRESHOLD
-            # - FILTER_CLASSES
-            # - COOLDOWN_SECONDS
-            for box in boxes:
-                conf = float(box.conf[0])
-                cls_id = int(box.cls[0])
-                if isinstance(names, dict):
-                    label = names.get(cls_id, str(cls_id))
+                if self.fps_history:
+                    self.fps = sum(v for (_, v) in self.fps_history) / len(self.fps_history)
                 else:
-                    label = names[cls_id]
+                    self.fps = 0.0
 
-                if self.should_log_detection(label, conf, now):
-                    self.log_callback(self.name, label, conf)
+                if self.bitrate_history:
+                    self.bitrate = sum(v for (_, v) in self.bitrate_history) / len(self.bitrate_history)
+                else:
+                    self.bitrate = 0.0
 
-            # Prikaz ali skrito
-            if self.show_stream:
-                self.frame = draw_frame.copy()
-            else:
-                self.frame = np.zeros_like(frame)
+                # LOGIRANJE – tu se upošteva:
+                # - CONFIDENCE_THRESHOLD
+                # - FILTER_CLASSES
+                # - COOLDOWN_SECONDS
+                for box in boxes:
+                    conf = float(box.conf[0])
+                    cls_id = int(box.cls[0])
+                    if isinstance(names, dict):
+                        label = names.get(cls_id, str(cls_id))
+                    else:
+                        label = names[cls_id]
 
-            # Posodobitev GUI
-            self.update_callback(self.name, self.frame, self.fps,
-                                 self.detections, self.bitrate,
-                                 self.reconnecting, self.last_connect)
+                    if self.should_log_detection(label, conf, now):
+                        self.log_callback(self.name, label, conf)
+
+                # Prikaz ali skrito
+                if self.show_stream:
+                    self.frame = draw_frame.copy()
+                else:
+                    self.frame = np.zeros_like(frame)
+
+                # Posodobitev GUI
+                self.update_callback(self.name, self.frame, self.fps,
+                                     self.detections, self.bitrate,
+                                     self.reconnecting, self.last_connect)
+            except Exception as e:
+                log_exception(f"{self.name} camera loop", e)
+                if self.cap:
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                self.cap = None
+                self.reconnecting = False
+                time.sleep(1)
 
         if self.cap:
             self.cap.release()
@@ -1061,69 +1112,71 @@ class YoloGUI:
     # ---------------- Status bar ------------
     def update_status_bar(self):
         global _last_net, _last_time
+        try:
+            # ---------------- CPU ----------------
+            cpu_usage = psutil.cpu_percent(interval=None)
 
-        # ---------------- CPU ----------------
-        cpu_usage = psutil.cpu_percent(interval=None)
+            # ---------------- RAM ----------------
+            ram = psutil.virtual_memory()
+            ram_usage = ram.percent
 
-        # ---------------- RAM ----------------
-        ram = psutil.virtual_memory()
-        ram_usage = ram.percent
+            # ---------------- GPU ----------------
+            gpu_load = 0
+            gpu_mem = 0
+            gpu_temp = 0
 
-        # ---------------- GPU ----------------
-        gpu_load = 0
-        gpu_mem = 0
-        gpu_temp = 0
+            if GPUtil:
+                try:
+                    gpus = GPUtil.getGPUs()
+                except Exception as e:
+                    gpus = []
+                    print(f"⚠ GPUtil ni na voljo ali ne deluje pravilno: {e}")
+                if gpus:
+                    gpu = gpus[0]
+                    gpu_load = gpu.load * 100
+                    gpu_mem = gpu.memoryUtil * 100
+                    gpu_temp = getattr(gpu, "temperature", 0)
 
-        if GPUtil:
-            try:
-                gpus = GPUtil.getGPUs()
-            except Exception as e:
-                gpus = []
-                print(f"⚠ GPUtil ni na voljo ali ne deluje pravilno: {e}")
-            if gpus:
-                gpu = gpus[0]
-                gpu_load = gpu.load * 100
-                gpu_mem = gpu.memoryUtil * 100
-                gpu_temp = getattr(gpu, "temperature", 0)
+            # ---------------- Internetni pretok ----------------
+            net = psutil.net_io_counters()
+            now = time.time()
 
-        # ---------------- Internetni pretok ----------------
-        net = psutil.net_io_counters()
-        now = time.time()
+            if _last_net is None:
+                up_speed = 0
+                down_speed = 0
+            else:
+                dt = now - _last_time
+                if dt <= 0:
+                    dt = 1e-6
+                up_speed = (net.bytes_sent - _last_net.bytes_sent) / dt
+                down_speed = (net.bytes_recv - _last_net.bytes_recv) / dt
 
-        if _last_net is None:
-            up_speed = 0
-            down_speed = 0
-        else:
-            dt = now - _last_time
-            if dt <= 0:
-                dt = 1e-6
-            up_speed = (net.bytes_sent - _last_net.bytes_sent) / dt
-            down_speed = (net.bytes_recv - _last_net.bytes_recv) / dt
+            _last_net = net
+            _last_time = now
 
-        _last_net = net
-        _last_time = now
+            up_str = format_bytes(up_speed)
+            down_str = format_bytes(down_speed)
 
-        up_str = format_bytes(up_speed)
-        down_str = format_bytes(down_speed)
+            # ---------------- Filtri YOLO ----------------
+            filtered = ", ".join(FILTER_CLASSES) if FILTER_CLASSES else "Vse"
 
-        # ---------------- Filtri YOLO ----------------
-        filtered = ", ".join(FILTER_CLASSES) if FILTER_CLASSES else "Vse"
-
-        # ---------------- Končni prikaz ----------------
-        self.status_label.config(
-            text=(
-                f"🧠 Naprava: {self.device.upper()}  |  "
-                f"CPU: {cpu_usage:.1f}%  |  "
-                f"RAM: {ram_usage:.1f}%  |  "
-                f"GPU: {gpu_load:.1f}%  |  "
-                f"VRAM: {gpu_mem:.1f}%  |  "
-                f"Temp: {gpu_temp}°C  |  "
-                f"↑ {up_str}  ↓ {down_str}  |  "
-                f"YOLO model: {self.yolo_model_name} ({'YOLO-World' if self.use_yolo_world else 'YOLO'})  |  "
-                f"Filtrirani razredi: {filtered}  |  "
-                f"{datetime.now().strftime('%H:%M:%S')}"
+            # ---------------- Končni prikaz ----------------
+            self.status_label.config(
+                text=(
+                    f"🧠 Naprava: {self.device.upper()}  |  "
+                    f"CPU: {cpu_usage:.1f}%  |  "
+                    f"RAM: {ram_usage:.1f}%  |  "
+                    f"GPU: {gpu_load:.1f}%  |  "
+                    f"VRAM: {gpu_mem:.1f}%  |  "
+                    f"Temp: {gpu_temp}°C  |  "
+                    f"↑ {up_str}  ↓ {down_str}  |  "
+                    f"YOLO model: {self.yolo_model_name} ({'YOLO-World' if self.use_yolo_world else 'YOLO'})  |  "
+                    f"Filtrirani razredi: {filtered}  |  "
+                    f"{datetime.now().strftime('%H:%M:%S')}"
+                )
             )
-        )
+        except Exception as e:
+            log_exception("status bar", e)
         # osveži vsakih 1000 ms
         self.root.after(1000, self.update_status_bar)
         
