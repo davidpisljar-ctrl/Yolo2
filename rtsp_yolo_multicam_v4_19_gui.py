@@ -147,6 +147,17 @@ if hasattr(threading, "excepthook"):
     def _thread_excepthook(args):
         log_unhandled(args.exc_type, args.exc_value, args.exc_traceback)
     threading.excepthook = _thread_excepthook
+else:
+    # Za starejše verzije Pythona brez threading.excepthook
+    def _run_with_hook(*args, **kwargs):
+        try:
+            return threading.Thread._bootstrap_original(*args, **kwargs)  # type: ignore[attr-defined]
+        except Exception:
+            log_unhandled(*sys.exc_info())
+            raise
+    if not hasattr(threading.Thread, "_bootstrap_original"):
+        threading.Thread._bootstrap_original = threading.Thread._bootstrap  # type: ignore[attr-defined]
+    threading.Thread._bootstrap = _run_with_hook  # type: ignore[attr-defined]
 
 torch.backends.cudnn.benchmark = True
 
@@ -545,6 +556,12 @@ class YoloGUI:
         )
         self.status_label.pack(side="bottom", fill="x")
 
+        # števec za ponavljajoče se MySQL napake
+        self.mysql_failures = 0
+
+        # hook za tkinter napake, da gredo v errors.log
+        self.root.report_callback_exception = self.tk_exception_hook
+
         self.load_model()
         self.init_mysql()
         self.load_cameras()
@@ -566,6 +583,9 @@ class YoloGUI:
             return "cuda"
         print("CPU")
         return "cpu"
+
+    def tk_exception_hook(self, exc_type, exc_value, exc_tb):
+        log_unhandled(exc_type, exc_value, exc_tb)
 
     # ---------------- Model ----------------
     def load_model(self):
@@ -742,6 +762,10 @@ class YoloGUI:
             if self.mysql_conn is None:
                 return
 
+            # preveri ali je povezava še živa in po potrebi reconnect
+            if not self.ensure_mysql_connection():
+                return
+
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             sql = """
@@ -762,14 +786,20 @@ class YoloGUI:
                     cursor.close()
 
                     # OK, imamo success → prekini retry
+                    self.mysql_failures = 0
                     return
 
                 except Exception as e:
                     log_exception(f"MySQL log poskus {attempt}/{attempts}", e)
+                    self.mysql_failures += 1
 
                     # Če smo izčrpali poskuse → končaj
                     if attempt == attempts:
                         print("❌ MySQL log FAILED po 3 poskusih.\n")
+                        # po več neuspelih poskusih začasno onemogoči MySQL da preprečimo sesutje
+                        if self.mysql_failures >= 3:
+                            self.mysql_enabled = False
+                            print("⚠ MySQL logiranje onemogočeno zaradi ponavljajočih se napak.")
                         return
 
                     # Poskusi reconnect
@@ -817,7 +847,8 @@ class YoloGUI:
                 user=user,
                 password=password,
                 database=database,
-                autocommit=True
+                autocommit=True,
+                connection_timeout=5
             )
             if self.mysql_conn.is_connected():
                 self.mysql_enabled = True
@@ -835,6 +866,7 @@ class YoloGUI:
         """Poskusi ponovno vzpostaviti MySQL povezavo."""
         if not self.mysql_enabled:
             return
+        self.mysql_conn = None  # prisili novo povezavo ob naslednji rabi
 
         if "mysql" not in config:
             return
@@ -854,11 +886,13 @@ class YoloGUI:
                 user=user,
                 password=password,
                 database=database,
-                autocommit=True
+                autocommit=True,
+                connection_timeout=5
             )
 
             if self.mysql_conn.is_connected():
                 print("✔ MySQL ponovno povezan!")
+                self.mysql_failures = 0
                 return True
 
         except Exception as e:
@@ -867,6 +901,23 @@ class YoloGUI:
         # fallback
         self.mysql_conn = None
         return False
+
+    def ensure_mysql_connection(self):
+        """Preveri ali je povezava živa; če ne, poskusi ping/reconnect in vrne bool."""
+        if not self.mysql_enabled:
+            return False
+
+        if self.mysql_conn is None:
+            return self.reconnect_mysql()
+
+        try:
+            # ping bo dvignil izjemo, če povezave ni
+            self.mysql_conn.ping(reconnect=True, attempts=1, delay=0)
+            return True
+        except Exception as e:
+            log_exception("MySQL ping", e)
+            self.mysql_conn = None
+            return self.reconnect_mysql()
                 
             
 
