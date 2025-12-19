@@ -780,6 +780,7 @@ class YoloGUI:
             attempts = 3
 
             for attempt in range(1, attempts + 1):
+                cursor = None
                 try:
                     cursor = self.mysql_conn.cursor()
                     cursor.execute(sql, data)
@@ -792,6 +793,18 @@ class YoloGUI:
                 except Exception as e:
                     log_exception(f"MySQL log poskus {attempt}/{attempts}", e)
                     self.mysql_failures += 1
+                    # zapri kurzor, če je živ
+                    try:
+                        if cursor:
+                            cursor.close()
+                    except Exception:
+                        pass
+
+                    # Če gre za izgubo povezave, takoj poskusi novo povezavo
+                    errno = getattr(e, "errno", None)
+                    if errno in (2006, 2013):  # MySQL server has gone away / lost connection
+                        self.mysql_conn = None
+                        self.reconnect_mysql()
 
                     # Če smo izčrpali poskuse → končaj
                     if attempt == attempts:
@@ -805,12 +818,8 @@ class YoloGUI:
                     # Poskusi reconnect
                     print("↻ Poskus ponovne vzpostavitve MySQL povezave...")
                     self.reconnect_mysql()
-                    time.sleep(0.5)  # malo počakaj
         except Exception as e:
             log_exception("tracker logging", e)
-
-
-
 
     # ---------------- MySQL logging ------------------
     def init_mysql(self):
@@ -853,6 +862,7 @@ class YoloGUI:
             if self.mysql_conn.is_connected():
                 self.mysql_enabled = True
                 print(f"MySQL: Povezava uspešna na {host}:{port}, baza {database}")
+                self.mysql_failures = 0
             else:
                 self.mysql_enabled = False
                 print("MySQL: Povezava ni uspela.")
