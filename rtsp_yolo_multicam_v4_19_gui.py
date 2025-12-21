@@ -14,6 +14,7 @@ import configparser
 import psutil
 import traceback
 import sys
+import queue
 
 # Nekatera okolja nimajo vseh odvisnosti – omogoči robusten fallback
 try:
@@ -562,6 +563,10 @@ class YoloGUI:
         # hook za tkinter napake, da gredo v errors.log
         self.root.report_callback_exception = self.tk_exception_hook
 
+        # MySQL worker in watchdog
+        self.mysql_worker = None
+        self.mysql_watchdog_thread = None
+
         self.load_model()
         self.init_mysql()
         self.load_cameras()
@@ -575,6 +580,11 @@ class YoloGUI:
             with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["čas", "kamera", "objekt", "verjetnost"])
+
+        # zaženi MySQL worker, če je omogočen
+        if self.mysql_enabled:
+            self.start_mysql_worker()
+            self.start_mysql_watchdog()
 
     # ---------------- Device ----------------
     def select_device(self):
@@ -737,7 +747,7 @@ class YoloGUI:
 
     # ---------------- Deeptracker Logging ------------------
     def log_tracker_detection(self, camera_name, track_id, label, conf, filename):
-        """Logiranje v CSV + (opcijsko) v MySQL tabelo YOLO_DT z retry sistemom."""
+        """Logiranje v CSV + (opcijsko) v MySQL tabelo YOLO_DT preko workerja."""
         try:
             # 1) CSV log
             if self.tracker_logging:
@@ -755,69 +765,11 @@ class YoloGUI:
                 except Exception as e:
                     log_exception("tracker CSV write", e)
 
-            # 2) MySQL log
-            if not self.mysql_enabled:
-                return
-
-            if self.mysql_conn is None:
-                return
-
-            # preveri ali je povezava še živa in po potrebi reconnect
-            if not self.ensure_mysql_connection():
-                return
-
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            sql = """
-                INSERT INTO YOLO_DT
-                    (ts, camera_name, track_id, yolo_class, confidence, filename, plate_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """
-
-            data = (ts, camera_name, int(track_id), label, float(conf), filename or "", None)
-
-            # --- retry logika (max 3 poskusi) ---
-            attempts = 3
-
-            for attempt in range(1, attempts + 1):
-                cursor = None
-                try:
-                    cursor = self.mysql_conn.cursor()
-                    cursor.execute(sql, data)
-                    cursor.close()
-
-                    # OK, imamo success → prekini retry
-                    self.mysql_failures = 0
-                    return
-
-                except Exception as e:
-                    log_exception(f"MySQL log poskus {attempt}/{attempts}", e)
-                    self.mysql_failures += 1
-                    # zapri kurzor, če je živ
-                    try:
-                        if cursor:
-                            cursor.close()
-                    except Exception:
-                        pass
-
-                    # Če gre za izgubo povezave, takoj poskusi novo povezavo
-                    errno = getattr(e, "errno", None)
-                    if errno in (2006, 2013):  # MySQL server has gone away / lost connection
-                        self.mysql_conn = None
-                        self.reconnect_mysql()
-
-                    # Če smo izčrpali poskuse → končaj
-                    if attempt == attempts:
-                        print("❌ MySQL log FAILED po 3 poskusih.\n")
-                        # po več neuspelih poskusih začasno onemogoči MySQL da preprečimo sesutje
-                        if self.mysql_failures >= 3:
-                            self.mysql_enabled = False
-                            print("⚠ MySQL logiranje onemogočeno zaradi ponavljajočih se napak.")
-                        return
-
-                    # Poskusi reconnect
-                    print("↻ Poskus ponovne vzpostavitve MySQL povezave...")
-                    self.reconnect_mysql()
+            # 2) MySQL log (enqueue)
+            if self.mysql_worker and not self.mysql_worker.disabled:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                payload = (ts, camera_name, int(track_id), label, float(conf), filename or "", None)
+                self.mysql_worker.enqueue(payload)
         except Exception as e:
             log_exception("tracker logging", e)
 
@@ -870,6 +822,16 @@ class YoloGUI:
             self.mysql_enabled = False
             self.mysql_conn = None
             log_exception("MySQL inicializacija", e)
+
+        # pripravi worker config
+        self.mysql_cfg = {
+            "enabled": self.mysql_enabled,
+            "host": host,
+            "port": port,
+            "user": user,
+            "password": password,
+            "database": database,
+        }
             
             
     def reconnect_mysql(self):
@@ -912,6 +874,42 @@ class YoloGUI:
         self.mysql_conn = None
         return False
 
+    def start_mysql_worker(self):
+        if getattr(self, "mysql_worker", None):
+            return
+        if not getattr(self, "mysql_cfg", None):
+            return
+        self.mysql_worker = MySQLWorker(self.mysql_cfg)
+        self.mysql_worker.start()
+        print("▶ MySQL worker zagnan.")
+
+    def restart_mysql_worker(self):
+        if getattr(self, "mysql_worker", None):
+            try:
+                self.mysql_worker.stop()
+            except Exception:
+                pass
+        self.mysql_worker = MySQLWorker(self.mysql_cfg)
+        self.mysql_worker.start()
+        print("↻ MySQL worker ponovno zagnan.")
+
+    def start_mysql_watchdog(self):
+        if getattr(self, "mysql_watchdog_thread", None):
+            return
+
+        def watchdog():
+            while True:
+                time.sleep(5)
+                worker = self.mysql_worker
+                if worker is None:
+                    continue
+                if worker.disabled or not worker.is_alive():
+                    log_exception("MySQL watchdog", RuntimeError("worker ni aktiven, restart"))
+                    self.restart_mysql_worker()
+
+        self.mysql_watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+        self.mysql_watchdog_thread.start()
+
     def ensure_mysql_connection(self):
         """Preveri ali je povezava živa; če ne, poskusi ping/reconnect in vrne bool."""
         if not self.mysql_enabled:
@@ -928,6 +926,94 @@ class YoloGUI:
             log_exception("MySQL ping", e)
             self.mysql_conn = None
             return self.reconnect_mysql()
+
+
+class MySQLWorker(threading.Thread):
+    """Enojna MySQL worker nit, ki serijsko obdela zahteve iz vrste, da se izognemo deljenim povezavam med nitmi."""
+    def __init__(self, cfg, queue_max=1000):
+        super().__init__(daemon=True)
+        self.cfg = cfg
+        self.q = queue.Queue(maxsize=queue_max)
+        self.stop_event = threading.Event()
+        self.mysql_enabled = cfg.get("enabled", False)
+        self.mysql_conn = None
+        self.failures = 0
+        self.max_failures = 5
+        self.disabled = False
+        self.last_error = None
+
+    def run(self):
+        if not self.mysql_enabled:
+            return
+        while not self.stop_event.is_set():
+            try:
+                item = self.q.get(timeout=1)
+            except queue.Empty:
+                continue
+            try:
+                self.ensure_connection()
+                self.insert_record(item)
+                self.failures = 0
+            except Exception as e:
+                self.failures += 1
+                self.last_error = e
+                log_exception("MySQL worker insert", e)
+                self.mysql_conn = None
+                if self.failures >= self.max_failures:
+                    self.disabled = True
+                    print("⚠ MySQL worker onemogočen zaradi ponavljajočih se napak.")
+                time.sleep(0.5)
+            finally:
+                self.q.task_done()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def enqueue(self, payload):
+        if self.disabled or not self.mysql_enabled:
+            return
+        try:
+            self.q.put(payload, timeout=0.1)
+        except queue.Full:
+            log_exception("MySQL worker queue polna", RuntimeError("Queue full, dropping payload"))
+
+    def ensure_connection(self):
+        if self.mysql_conn and self.mysql_conn.is_connected():
+            try:
+                self.mysql_conn.ping(reconnect=True, attempts=1, delay=0)
+                return
+            except Exception:
+                self.mysql_conn = None
+        mysql_cfg = self.cfg
+        self.mysql_conn = mysql.connector.connect(
+            host=mysql_cfg.get("host", "127.0.0.1"),
+            port=int(mysql_cfg.get("port", 3306)),
+            user=mysql_cfg.get("user", ""),
+            password=mysql_cfg.get("password", ""),
+            database=mysql_cfg.get("database", "YOLO_DB"),
+            autocommit=True,
+            connection_timeout=5
+        )
+        self.failures = 0
+
+    def insert_record(self, payload):
+        if self.disabled:
+            return
+        sql = """
+            INSERT INTO YOLO_DT
+                (ts, camera_name, track_id, yolo_class, confidence, filename, plate_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """
+        cursor = None
+        try:
+            cursor = self.mysql_conn.cursor()
+            cursor.execute(sql, payload)
+        finally:
+            try:
+                if cursor:
+                    cursor.close()
+            except Exception:
+                pass
                 
             
 
@@ -1274,6 +1360,11 @@ class YoloGUI:
     def exit_app(self):
         for t in self.threads.values():
             t.stop()
+        if getattr(self, "mysql_worker", None):
+            try:
+                self.mysql_worker.stop()
+            except Exception:
+                pass
         self.root.destroy()
         print("Program zaključen.")
 
