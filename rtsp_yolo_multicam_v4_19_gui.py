@@ -1079,6 +1079,10 @@ class MySQLWorker(threading.Thread):
 
     # ---------------- Grid ------------------
     def build_grid(self):
+        """Public wrapper za zagon mreže iz __init__, vedno obstaja kot atribut."""
+        self._build_grid_impl()
+
+    def _build_grid_impl(self):
         for widget in self.main_frame.winfo_children():
             widget.destroy()
 
